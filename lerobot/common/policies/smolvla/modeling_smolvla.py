@@ -157,9 +157,13 @@ def load_smolvla(
 
     state_dict, _ = standardise_state_dict(state_dict, set(model.state_dict().keys()))
 
-    missing, unexpected = model.load_state_dict(state_dict)
+    # HACK(aliberts): to not overwrite normalization parameters as they should come from the dataset
+    norm_keys = ("normalize_inputs", "normalize_targets", "unnormalize_outputs")
+    state_dict = {k: v for k, v in state_dict.items() if not k.startswith(norm_keys)}
 
-    if missing or unexpected:
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    if not all(key.startswith(norm_keys) for key in missing) or unexpected:
         raise RuntimeError(
             "SmolVLA %d missing / %d unexpected keys",
             len(missing),
@@ -379,6 +383,45 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
+    def _get_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        for k in batch:
+            if k in self._queues:
+                batch[k] = torch.stack(list(self._queues[k]), dim=1)
+
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens, lang_masks = self.prepare_language(batch)
+
+        actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state, noise=noise)
+
+        # Unpad actions
+        original_action_dim = self.config.action_feature.shape[0]
+        actions = actions[:, :, :original_action_dim]
+
+        actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
+
+        if self.config.adapt_to_pi_aloha:
+            actions = self._pi_aloha_encode_actions(actions)
+
+        return actions
+
+    def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        if self.config.adapt_to_pi_aloha:
+            batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
+
+        batch = self.normalize_inputs(batch)
+
+        return batch
+
+    def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        self.eval()
+
+        batch = self._prepare_batch(batch)
+        self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+
+        actions = self._get_action_chunk(batch, noise)
+        return actions
+
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Select a single action given environment observations.
@@ -388,38 +431,18 @@ class SmolVLAPolicy(PreTrainedPolicy):
         queue is empty.
         """
         self.eval()
-
-        if self.config.adapt_to_pi_aloha:
-            batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
-
-        batch = self.normalize_inputs(batch)
-
+        batch = self._prepare_batch(batch)
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
+
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
         if len(self._queues[ACTION]) == 0:
-            for k in batch:
-                if k in self._queues:
-                    batch[k] = torch.stack(list(self._queues[k]), dim=1)
-            images, img_masks = self.prepare_images(batch)
-            state = self.prepare_state(batch)
-            lang_tokens, lang_masks = self.prepare_language(batch)
+            actions = self._get_action_chunk(batch, noise)
 
-            actions = self.model.sample_actions(
-                images, img_masks, lang_tokens, lang_masks, state, noise=noise
-            )
-            # Unpad actions
-            original_action_dim = self.config.action_feature.shape[0]
-            actions = actions[:, :, :original_action_dim]
-
-            actions = self.unnormalize_outputs({"action": actions})["action"]
-
-            if self.config.adapt_to_pi_aloha:
-                actions = self._pi_aloha_encode_actions(actions)
-
-            # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
+            # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
+
         return self._queues[ACTION].popleft()
 
     def forward(self, batch: dict[str, Tensor], noise=None, time=None) -> dict[str, Tensor]:
